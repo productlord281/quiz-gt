@@ -4,7 +4,8 @@
 
 const ADMIN = process.env.QUIZ_ADMIN || 'illumi13'; // can be overridden with an env var in Vercel
 const TTL = 6 * 3600;                               // everything auto-expires after 6 hours
-const K = {s: 'gtq:state', p: 'gtq:players', sc: 'gtq:scores', a: 'gtq:ans:'};
+const HB = 15;                                      // host heartbeat: if the host's screen goes quiet for 15 s, the game is over
+const K = {hb: 'gtq:hb', s: 'gtq:state', p: 'gtq:players', sc: 'gtq:scores', a: 'gtq:ans:'};
 
 function conf() {
   const e = process.env;
@@ -31,7 +32,7 @@ async function rp(cmds) {
 const qi = v => { const n = Number(v); return Number.isInteger(n) && n >= 0 && n < 50 ? n : null; };
 const idOk = v => typeof v === 'string' && /^[a-z0-9]{4,20}$/i.test(v);
 const nm = v => String(v || '').trim().slice(0, 16);
-const PHASES = ['lobby', 'open', 'reveal', 'break', 'done'];
+const PHASES = ['lobby', 'meme', 'open', 'reveal', 'between', 'done'];
 
 module.exports = async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
@@ -51,14 +52,20 @@ module.exports = async (req, res) => {
 
       // every device calls this once a second: 1 Redis command for players, 3 for the admin
       case 'poll': {
-        const cmds = [['GET', K.s]];
+        const cmds = [['MGET', K.s, K.hb]];
         if (adm) {
+          cmds.push(['SET', K.hb, '1', 'EX', HB]);           // the host's poll doubles as its heartbeat
           cmds.push(['HLEN', K.p]);
           const i = qi(b.i);
-          if (i !== null) cmds.push(['HLEN', K.a + i]);
+          if (i !== null) cmds.push(['HVALS', K.a + i]);
         }
-        const [s, np, na] = await rp(cmds);
-        return res.json({ok: true, s: s ? JSON.parse(s) : null, np: np || 0, na: na || 0});
+        const out = await rp(cmds);
+        const raw = out[0][0], alive = out[0][1];
+        let s = raw ? JSON.parse(raw) : null;
+        if (!adm && s && !alive && s.phase !== 'lobby' && s.phase !== 'done') s = Object.assign({}, s, {phase: 'ended'});
+        const av = adm && Array.isArray(out[3]) ? out[3] : [];
+        const d = [0, 1, 2, 3].map(j => av.filter(v => Number(v) === j).length);   // how many picked each option (host only)
+        return res.json({ok: true, s, np: adm ? out[2] || 0 : 0, na: av.length, d});
       }
 
       case 'join': {
@@ -70,7 +77,7 @@ module.exports = async (req, res) => {
 
       case 'ans': {
         const i = qi(b.i), k = Number(b.k);
-        if (i === null || !idOk(b.id) || ![0, 1, 2].includes(k)) return res.json({ok: false});
+        if (i === null || !idOk(b.id) || ![0, 1, 2, 3].includes(k)) return res.json({ok: false});
         await rp([['HSETNX', K.a + i, b.id, k], ['EXPIRE', K.a + i, TTL]]); // first answer wins
         return res.json({ok: true});
       }
@@ -91,16 +98,18 @@ module.exports = async (req, res) => {
       case 'score': {
         const s = Math.round(Number(b.score));
         if (!idOk(b.id) || !nm(b.name) || !(s >= 0 && s <= 100000)) return res.json({ok: false});
-        await rp([['HSET', K.sc, b.id, JSON.stringify({n: nm(b.name), s})], ['EXPIRE', K.sc, TTL]]);
+        await rp([['HSET', K.sc, b.id, JSON.stringify({n: nm(b.name), s, c: Math.min(50, Math.max(0, Math.round(Number(b.c)) || 0))})], ['EXPIRE', K.sc, TTL]]);
         return res.json({ok: true});
       }
 
       case 'board': {
         const [flat] = await rp([['HGETALL', K.sc]]);
         const rows = [];
-        for (let x = 1; x < (flat || []).length; x += 2) { try { rows.push(JSON.parse(flat[x])); } catch (e) {} }
+        for (let x = 1; x < (flat || []).length; x += 2) { try { const r = JSON.parse(flat[x]); r.id = flat[x - 1]; rows.push(r); } catch (e) {} }
         rows.sort((p, q) => q.s - p.s);
-        return res.json({ok: true, b: rows.slice(0, 5)});
+        const w = rows.find(r => r.id === b.id);
+        const me = w ? {r: rows.filter(r => r.s > w.s).length + 1, s: w.s, c: w.c} : null;   // ties share a rank
+        return res.json({ok: true, b: rows.slice(0, 50).map(r => ({n: r.n, s: r.s, c: r.c})), t: rows.length, me});
       }
 
       case 'reset': {
@@ -109,6 +118,7 @@ module.exports = async (req, res) => {
         const cmds = [['DEL', K.p, K.sc]];
         for (let i = 0; i < 50; i++) cmds.push(['DEL', K.a + i]);
         cmds.push(['SET', K.s, JSON.stringify({i: -1, phase: 'lobby', n: Date.now(), g}), 'EX', TTL]);
+        cmds.push(['SET', K.hb, '1', 'EX', HB]);
         await rp(cmds);
         return res.json({ok: true});
       }
